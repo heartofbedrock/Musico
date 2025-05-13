@@ -1,12 +1,7 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits } = require('discord.js');
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus
-} = require('@discordjs/voice');
+const { Client, GatewayIntentBits, REST, Routes, AudioPlayerStatus, createAudioPlayer, createAudioResource, joinVoiceChannel } = require('discord.js');
+const { SlashCommandBuilder } = require('@discordjs/builders');
 const ytdl = require('ytdl-core');
 const ytsr = require('ytsr');
 const SpotifyWebApi = require('spotify-web-api-node');
@@ -17,66 +12,90 @@ const spotify = new SpotifyWebApi({
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
 });
 
-// ------ Guild Queues ------
-const guildQueues = new Map(); // guildId => { voiceChannel, connection, player, tracks: [], current }
+// ------ In-memory guild queues ------
+// Map<guildId, { voiceChannel, textChannel, connection, player, tracks: [], current }>
+const guildQueues = new Map();
+
+// ------ Define slash commands ------
+const commands = [
+  new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('Add a Spotify track URL or search terms to the queue')
+    .addStringOption(opt => opt.setName('query').setDescription('Spotify URL or search terms').setRequired(true)),
+  new SlashCommandBuilder().setName('skip').setDescription('Skip the current track'),
+  new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
+  new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop playback and clear the queue'),
+  new SlashCommandBuilder().setName('queue').setDescription('Show the current queue'),
+  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the track currently playing'),
+].map(cmd => cmd.toJSON());
+
+// ------ Register slash commands ------
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+(async () => {
+  try {
+    console.log('⏳ Refreshing slash commands...');
+    if (process.env.GUILD_ID) {
+      await rest.put(
+        Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+        { body: commands }
+      );
+      console.log('✅ Registered guild commands.');
+    } else {
+      await rest.put(
+        Routes.applicationCommands(process.env.CLIENT_ID),
+        { body: commands }
+      );
+      console.log('✅ Registered global commands.');
+    }
+  } catch (err) {
+    console.error('❌ Error registering commands:', err);
+  }
+})();
 
 // ------ Discord Client ------
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages
-  ]
-});
-
-const prefix = '/';
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 
 client.once('ready', () => {
   console.log(`✔️  Logged in as ${client.user.tag}`);
 });
 
-// ------ Helper: Connect & Create Player ------
-function createQueue(guildId, voiceChannel) {
+// ------ Queue Helpers ------
+function createQueue(guildId, voiceChannel, textChannel) {
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId,
     adapterCreator: voiceChannel.guild.voiceAdapterCreator,
   });
-
   const player = createAudioPlayer();
   connection.subscribe(player);
 
   player.on('stateChange', (_oldState, newState) => {
-    if (newState.status === AudioPlayerStatus.Idle) {
-      playNext(guildId);
-    }
+    if (newState.status === AudioPlayerStatus.Idle) playNext(guildId);
   });
 
-  const queue = { voiceChannel, connection, player, tracks: [], current: null };
+  const queue = { voiceChannel, textChannel, connection, player, tracks: [], current: null };
   guildQueues.set(guildId, queue);
   return queue;
 }
 
-// ------ Helper: Play Next Track ------
 async function playNext(guildId) {
   const queue = guildQueues.get(guildId);
   if (!queue) return;
 
-  const nextTrack = queue.tracks.shift();
-  if (!nextTrack) {
+  const next = queue.tracks.shift();
+  if (!next) {
     queue.connection.destroy();
     guildQueues.delete(guildId);
     return;
   }
 
-  queue.current = nextTrack;
-  const stream = ytdl(nextTrack.url, { filter: 'audioonly' });
-  const resource = createAudioResource(stream);
-  queue.player.play(resource);
-  queue.voiceChannel.send(`▶️ Now playing: **${nextTrack.title}**`);
+  queue.current = next;
+  const stream = ytdl(next.url, { filter: 'audioonly' });
+  queue.player.play(createAudioResource(stream));
+  queue.textChannel.send(`▶️ Now playing: **${next.title}**`);
 }
 
-// ------ Helper: Resolve Track (Spotify or YouTube) ------
 async function resolveTrack(query) {
   if (/spotify\.com\/track/.test(query)) {
     const data = await spotify.clientCredentialsGrant();
@@ -85,93 +104,89 @@ async function resolveTrack(query) {
     const { body: track } = await spotify.getTrack(id);
 
     const title = `${track.artists[0].name} - ${track.name}`;
-    const search = await ytsr(`${title} audio`, { limit: 5 });
-    const item = search.items.find(i => i.type === 'video');
-    if (!item) throw new Error('No YouTube result found for Spotify track.');
+    const results = await ytsr(`${title} audio`, { limit: 5 });
+    const item = results.items.find(i => i.type === 'video');
+    if (!item) throw new Error('No YouTube result found.');
 
     return { title, url: item.url };
   } else {
-    const search = await ytsr(query, { limit: 5 });
-    const item = search.items.find(i => i.type === 'video');
+    const results = await ytsr(query, { limit: 5 });
+    const item = results.items.find(i => i.type === 'video');
     if (!item) throw new Error('No YouTube result found.');
-
     return { title: item.title, url: item.url };
   }
 }
 
-// ------ Command Handler ------
-client.on('messageCreate', async msg => {
-  if (!msg.content.startsWith(prefix) || msg.author.bot) return;
-  const guildId = msg.guild.id;
-  const args = msg.content.slice(prefix.length).trim().split(/ +/);
-  const command = args.shift().toLowerCase();
-  const voiceChannel = msg.member.voice.channel;
+// ------ Interaction Handler ------
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName } = interaction;
+  const guildId = interaction.guildId;
+  let queue = guildQueues.get(guildId);
 
-  switch (command) {
-    case 'play': {
-      if (!voiceChannel) return msg.reply('🔊 Join a voice channel first.');
-      try {
-        const track = await resolveTrack(args.join(' '));
-        let queue = guildQueues.get(guildId);
-        if (!queue) queue = createQueue(guildId, voiceChannel);
+  try {
+    switch (commandName) {
+      case 'play': {
+        const voiceChannel = interaction.member.voice.channel;
+        if (!voiceChannel) return interaction.reply({ content: '🔊 Join a voice channel first.', ephemeral: true });
+        const query = interaction.options.getString('query');
+        const track = await resolveTrack(query);
+
+        if (!queue) queue = createQueue(guildId, voiceChannel, interaction.channel);
         queue.tracks.push(track);
-        msg.reply(`➕ Added to queue: **${track.title}**`);
+        await interaction.reply({ content: `➕ Added to queue: **${track.title}**` });
         if (queue.tracks.length === 1 && !queue.current) playNext(guildId);
-      } catch (err) {
-        console.error(err);
-        msg.reply('❌ Unable to add that track.');
+        break;
       }
-      break;
+      case 'skip': {
+        if (!queue) return interaction.reply({ content: '⚠️ Nothing to skip.', ephemeral: true });
+        queue.player.stop();
+        await interaction.reply('⏭️ Skipped the current track.');
+        break;
+      }
+      case 'pause': {
+        if (!queue) return interaction.reply({ content: '⚠️ Nothing is playing.', ephemeral: true });
+        queue.player.pause();
+        await interaction.reply('⏸️ Playback paused.');
+        break;
+      }
+      case 'resume': {
+        if (!queue) return interaction.reply({ content: '⚠️ Nothing to resume.', ephemeral: true });
+        queue.player.unpause();
+        await interaction.reply('▶️ Playback resumed.');
+        break;
+      }
+      case 'stop': {
+        if (!queue) return interaction.reply({ content: '⚠️ Nothing is playing.', ephemeral: true });
+        queue.tracks = [];
+        queue.player.stop();
+        queue.connection.destroy();
+        guildQueues.delete(guildId);
+        await interaction.reply('🛑 Stopped playback and cleared the queue.');
+        break;
+      }
+      case 'queue': {
+        if (!queue || (!queue.current && queue.tracks.length === 0))
+          return interaction.reply({ content: '📭 The queue is empty.', ephemeral: true });
+        const list = [];
+        if (queue.current) list.push(`Now playing: **${queue.current.title}**`);
+        queue.tracks.forEach((t, i) => list.push(`${i + 1}. ${t.title}`));
+        await interaction.reply(list.join('\n'));
+        break;
+      }
+      case 'nowplaying': {
+        if (!queue || !queue.current)
+          return interaction.reply({ content: 'ℹ️ Nothing is currently playing.', ephemeral: true });
+        await interaction.reply(`▶️ Now playing: **${queue.current.title}**`);
+        break;
+      }
     }
-    case 'skip': {
-      const queue = guildQueues.get(guildId);
-      if (!queue) return msg.reply('⚠️ Nothing to skip.');
-      queue.player.stop();
-      msg.reply('⏭️ Skipped the current track.');
-      break;
-    }
-    case 'pause': {
-      const queue = guildQueues.get(guildId);
-      if (!queue) return msg.reply('⚠️ Nothing is playing.');
-      queue.player.pause();
-      msg.reply('� paused playback.');
-      break;
-    }
-    case 'resume': {
-      const queue = guildQueues.get(guildId);
-      if (!queue) return msg.reply('⚠️ Nothing to resume.');
-      queue.player.unpause();
-      msg.reply('▶️ Playback resumed.');
-      break;
-    }
-    case 'stop': {
-      const queue = guildQueues.get(guildId);
-      if (!queue) return msg.reply('⚠️ Nothing is playing.');
-      queue.tracks = [];
-      queue.player.stop();
-      queue.connection.destroy();
-      guildQueues.delete(guildId);
-      msg.reply('🛑 Stopped playback and cleared the queue.');
-      break;
-    }
-    case 'queue': {
-      const queue = guildQueues.get(guildId);
-      if (!queue || (!queue.current && queue.tracks.length === 0))
-        return msg.reply('📭 The queue is empty.');
-      const lines = [];
-      if (queue.current) lines.push(`Now playing: **${queue.current.title}**`);
-      queue.tracks.forEach((t, i) => lines.push(`${i + 1}. ${t.title}`));
-      msg.reply(lines.join('\n'));
-      break;
-    }
-    case 'nowplaying':
-    case 'np': {
-      const queue = guildQueues.get(guildId);
-      if (!queue || !queue.current)
-        return msg.reply('ℹ️ Nothing is currently playing.');
-      msg.reply(`▶️ Now playing: **${queue.current.title}**`);
-      break;
-    }
+  } catch (err) {
+    console.error(err);
+    if (interaction.replied || interaction.deferred)
+      interaction.followUp({ content: '❌ Error executing command.', ephemeral: true });
+    else
+      interaction.reply({ content: '❌ Error executing command.', ephemeral: true });
   }
 });
 
