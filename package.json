@@ -1,0 +1,17 @@
+{
+  "name": "musico",
+  "version": "1.0.0",
+  "description": "A Discord music bot that plays from Spotify (via YouTube).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "@discordjs/voice": "^0.14.0",
+    "ytdl-core": "^4.11.1",
+    "ytsr": "^3.7.3",
+    "spotify-web-api-node": "^5.0.2",
+    "dotenv": "^16.5.0"
+  }
+}
